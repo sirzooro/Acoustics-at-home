@@ -23,6 +23,10 @@ http://www.fsf.org/licensing/licenses
 #include "stdafx.h"
 #include "linalg.h"
 
+#ifdef __SSE2__
+#include <immintrin.h>
+#endif
+
 // disable some irrelevant warnings
 #if (AE_COMPILER==AE_MSVC) && !defined(AE_ALL_WARNINGS)
 #pragma warning(disable:4100)
@@ -45365,6 +45369,98 @@ static void evd_internaldlaebz(ae_int_t ijob,
             c->ptr.p_double[ji] = 0.5*(ab->ptr.pp_double[ji][1]+ab->ptr.pp_double[ji][2]);
         }
     }
+	
+    auto postproc = [&](ae_int_t ji, ae_int_t itmp1, double tmp1)->bool
+    {
+        if( ijob<=2 )
+        {
+            
+            /*
+             * IJOB=2: Choose all intervals containing eigenvalues.
+             *
+             * Insure that N(w) is monotone
+             */
+            itmp1 = ae_minint(nab->ptr.pp_int[ji][2], ae_maxint(nab->ptr.pp_int[ji][1], itmp1, _state), _state);
+            
+            /*
+             * Update the Queue -- add intervals if both halves
+             * contain eigenvalues.
+             */
+            if( itmp1==nab->ptr.pp_int[ji][2] )
+            {
+                
+                /*
+                 * No eigenvalue in the upper interval:
+                 * just use the lower interval.
+                 */
+                ab->ptr.pp_double[ji][2] = tmp1;
+            }
+            else
+            {
+                if( itmp1==nab->ptr.pp_int[ji][1] )
+                {
+                    
+                    /*
+                     * No eigenvalue in the lower interval:
+                     * just use the upper interval.
+                     */
+                    ab->ptr.pp_double[ji][1] = tmp1;
+                }
+                else
+                {
+                    if( klnew<mmax )
+                    {
+                        
+                        /*
+                         * Eigenvalue in both intervals -- add upper to queue.
+                         */
+                        klnew = klnew+1;
+                        ab->ptr.pp_double[klnew][2] = ab->ptr.pp_double[ji][2];
+                        nab->ptr.pp_int[klnew][2] = nab->ptr.pp_int[ji][2];
+                        ab->ptr.pp_double[klnew][1] = tmp1;
+                        nab->ptr.pp_int[klnew][1] = itmp1;
+                        ab->ptr.pp_double[ji][2] = tmp1;
+                        nab->ptr.pp_int[ji][2] = itmp1;
+                    }
+                    else
+                    {
+                        *info = mmax+1;
+                        return true;
+                    }
+                }
+            }
+        }
+        else
+        {
+            
+            /*
+             * IJOB=3: Binary search.  Keep only the interval
+             * containing  w  s.t. N(w) = NVAL
+             */
+            if( itmp1<=nval->ptr.p_int[ji] )
+            {
+                ab->ptr.pp_double[ji][1] = tmp1;
+                nab->ptr.pp_int[ji][1] = itmp1;
+            }
+            if( itmp1>=nval->ptr.p_int[ji] )
+            {
+                ab->ptr.pp_double[ji][2] = tmp1;
+                nab->ptr.pp_int[ji][2] = itmp1;
+            }
+        }
+        
+        return false;
+    };
+	
+    typedef ae_int_t ae_int_v2t __attribute__((vector_size(16)));
+    typedef ae_int_t ae_int_v4t __attribute__((vector_size(32)));
+    typedef ae_int_t ae_int_v8t __attribute__((vector_size(64)));
+    
+#ifdef __x86_64__
+    static_assert(sizeof(ae_int_t) == 8, "ae_int_t must be 64 bit");
+#else // !__x86_64__
+    static_assert(sizeof(ae_int_t) == 4, "ae_int_t must be 32 bit");
+#endif // !__x86_64__
     
     /*
      * Iteration loop
@@ -45379,7 +45475,238 @@ static void evd_internaldlaebz(ae_int_t ijob,
          * Serial Version of the loop
          */
         klnew = kl;
-        for(ji=kf; ji<=kl; ji++)
+        ji=kf;
+        
+#ifdef __AVX512F__
+        for(; ji<=kl-7; ji+=8)
+        {
+            
+            /*
+             * Compute N(w), the number of eigenvalues less than w
+             */
+            __m512d tmp1 = _mm512_loadu_pd(&c->ptr.p_double[ji]);
+            __m512d tmp2 = _mm512_set1_pd(d->ptr.p_double[1])-tmp1;
+
+            //__mmask8 cmp = _mm512_cmple_pd_mask(tmp2, _mm512_set1_pd(pivmin));
+            __mmask8 cmp = _mm512_cmp_pd_mask(tmp2, _mm512_set1_pd(pivmin), _CMP_LE_OS);
+            __m512i itmp1 = _mm512_maskz_set1_epi64(cmp, 1);
+
+            __m512d tmp2min = _mm512_min_pd(tmp2, _mm512_set1_pd(-pivmin));
+            tmp2 = _mm512_mask_blend_pd(cmp, tmp2, tmp2min);
+            
+            for(j=2; j<=n; j++)
+            {
+                tmp2 = d->ptr.p_double[j]-e2->ptr.p_double[j-1]/tmp2-tmp1;
+
+                cmp = _mm512_cmp_pd_mask(tmp2, _mm512_set1_pd(pivmin), _CMP_LE_OS);
+
+                itmp1 = _mm512_mask_add_epi64(itmp1, cmp, itmp1, _mm512_set1_epi64(1));
+
+                tmp2min = _mm512_min_pd(tmp2, _mm512_set1_pd(-pivmin));
+                tmp2 = _mm512_mask_blend_pd(cmp, tmp2, tmp2min);
+            }
+
+            ae_int_v8t itmp1v = (ae_int_v8t)itmp1;
+            for (int idx = 0; idx < 8; ++idx)
+                if (postproc(ji + idx, itmp1v[idx], tmp1[idx]))
+                    return;
+        }
+
+        if(ji<=kl-3)
+        {
+            
+            /*
+             * Compute N(w), the number of eigenvalues less than w
+             */
+            __m256d tmp1 = _mm256_loadu_pd(&c->ptr.p_double[ji]);
+            __m256d tmp2 = _mm256_set1_pd(d->ptr.p_double[1])-tmp1;
+
+            //__mmask8 cmp = _mm512_cmple_pd_mask(tmp2, _mm512_set1_pd(pivmin));
+            __mmask8 cmp = _mm256_cmp_pd_mask(tmp2, _mm256_set1_pd(pivmin), _CMP_LE_OS);
+            __m256i itmp1 = _mm256_maskz_set1_epi64(cmp, 1);
+
+            __m256d tmp2min = _mm256_min_pd(tmp2, _mm256_set1_pd(-pivmin));
+            tmp2 = _mm256_mask_blend_pd(cmp, tmp2, tmp2min);
+            
+            for(j=2; j<=n; j++)
+            {
+                tmp2 = d->ptr.p_double[j]-e2->ptr.p_double[j-1]/tmp2-tmp1;
+
+                cmp = _mm256_cmp_pd_mask(tmp2, _mm256_set1_pd(pivmin), _CMP_LE_OS);
+
+                itmp1 = _mm256_mask_add_epi64(itmp1, cmp, itmp1, _mm256_set1_epi64x(1));
+
+                tmp2min = _mm256_min_pd(tmp2, _mm256_set1_pd(-pivmin));
+                tmp2 = _mm256_mask_blend_pd(cmp, tmp2, tmp2min);
+            }
+
+            ae_int_v4t itmp1v = (ae_int_v4t)itmp1;
+            for (int idx = 0; idx < 4; ++idx)
+                if (postproc(ji + idx, itmp1v[idx], tmp1[idx]))
+                    return;
+            
+            ji+=4;
+        }
+
+        if(ji<=kl-1)
+        {
+            
+            /*
+             * Compute N(w), the number of eigenvalues less than w
+             */
+            __m128d tmp1 = _mm_loadu_pd(&c->ptr.p_double[ji]);
+            __m128d tmp2 = _mm_set1_pd(d->ptr.p_double[1])-tmp1;
+
+            //__mmask8 cmp = _mm512_cmple_pd_mask(tmp2, _mm512_set1_pd(pivmin));
+            __mmask8 cmp = _mm_cmp_pd_mask(tmp2, _mm_set1_pd(pivmin), _CMP_LE_OS);
+            __m128i itmp1 = _mm_maskz_set1_epi64(cmp, 1);
+
+            __m128d tmp2min = _mm_min_pd(tmp2, _mm_set1_pd(-pivmin));
+            tmp2 = _mm_mask_blend_pd(cmp, tmp2, tmp2min);
+            
+            for(j=2; j<=n; j++)
+            {
+                tmp2 = d->ptr.p_double[j]-e2->ptr.p_double[j-1]/tmp2-tmp1;
+
+                cmp = _mm_cmp_pd_mask(tmp2, _mm_set1_pd(pivmin), _CMP_LE_OS);
+
+                itmp1 = _mm_mask_add_epi64(itmp1, cmp, itmp1, _mm_set1_epi64x(1));
+
+                tmp2min = _mm_min_pd(tmp2, _mm_set1_pd(-pivmin));
+                tmp2 = _mm_mask_blend_pd(cmp, tmp2, tmp2min);
+            }
+
+            ae_int_v2t itmp1v = (ae_int_v2t)itmp1;
+            for (int idx = 0; idx < 2; ++idx)
+                if (postproc(ji + idx, itmp1v[idx], tmp1[idx]))
+                    return;
+            
+            ji+=2;
+        }
+#else // !__AVX512F__
+
+#ifdef __AVX__
+        for(; ji<=kl-3; ji+=4)
+        {
+            /*
+             * Compute N(w), the number of eigenvalues less than w
+             */
+            __m256d tmp1 = _mm256_loadu_pd(&c->ptr.p_double[ji]);
+            __m256d tmp2 = _mm256_set1_pd(d->ptr.p_double[1])-tmp1;
+            
+            //__m256d tmp_cmp = _mm256_cmp_pd(tmp2, _mm256_set1_pd(pivmin), _CMP_LE_OS);
+            __m256d tmp_cmp = tmp2 <= _mm256_set1_pd(pivmin);
+#ifdef __AVX2__
+            __m256i itmp1 = _mm256_and_si256(_mm256_castpd_si256(tmp_cmp), _mm256_set1_epi64x(1));
+#else // !__AVX2__
+            __m256d tmp_cmp_and = _mm256_and_pd(tmp_cmp, _mm256_castsi256_pd(_mm256_set1_epi64x(1)));
+            __m128i itmp1_1 = _mm256_castsi256_si128(_mm256_castpd_si256(tmp_cmp_and));
+            __m128i itmp1_2 = _mm256_extractf128_si256(_mm256_castpd_si256(tmp_cmp_and), 1);
+#endif // !__AVX2__
+            __m256d tmp_min = _mm256_min_pd(tmp2,_mm256_set1_pd(-pivmin));
+            tmp2 = _mm256_blendv_pd(tmp2, tmp_min, tmp_cmp);
+            
+            for(j=2; j<=n; j++)
+            {
+                tmp2 = _mm256_set1_pd(d->ptr.p_double[j])-_mm256_set1_pd(e2->ptr.p_double[j-1])/tmp2-tmp1;
+                
+                //tmp_cmp = _mm256_cmp_pd(tmp2, _mm256_set1_pd(pivmin), _CMP_LE_OS);
+                tmp_cmp = tmp2 <= _mm256_set1_pd(pivmin);
+#ifdef __AVX2__
+                itmp1 = _mm256_add_epi64(itmp1, _mm256_and_si256(_mm256_castpd_si256(tmp_cmp), _mm256_set1_epi64x(1)));
+#else // !__AVX2__
+                tmp_cmp_and = _mm256_and_pd(tmp_cmp, _mm256_castsi256_pd(_mm256_set1_epi64x(1)));
+                itmp1_1 = _mm_add_epi64(itmp1_1, _mm256_castsi256_si128(_mm256_castpd_si256(tmp_cmp_and)));
+                itmp1_2 = _mm_add_epi64(itmp1_2, _mm256_extractf128_si256(_mm256_castpd_si256(tmp_cmp_and), 1));
+#endif // !__AVX2__
+                tmp_min = _mm256_min_pd(tmp2,_mm256_set1_pd(-pivmin));
+                tmp2 = _mm256_blendv_pd(tmp2, tmp_min, tmp_cmp);
+            }
+#ifdef __AVX2__
+            ae_int_v4t itmp1v = (ae_int_v4t)itmp1;
+            for (int idx = 0; idx < 4; ++idx)
+                if (postproc(ji + idx, itmp1v[idx], tmp1[idx]))
+                    return;
+#else // !__AVX2__
+            ae_int_v2t itmp1v = (ae_int_v2t)itmp1_1;
+            for (int idx = 0; idx < 2; ++idx)
+                if (postproc(ji + idx, itmp1v[idx], tmp1[idx]))
+                    return;
+            itmp1v = (ae_int_v2t)itmp1_2;
+            for (int idx = 0; idx < 2; ++idx)
+                if (postproc(ji + idx + 2, itmp1v[idx], tmp1[idx + 2]))
+                    return;
+#endif // !__AVX2__
+        }
+#endif // __AVX__
+        
+#ifdef __SSE2__
+#ifdef __AVX__
+        if(ji<=kl-1)
+#else // !__AVX__
+        for(; ji<=kl-1; ji+=2)
+#endif // !__AVX__
+        {
+            /*
+             * Compute N(w), the number of eigenvalues less than w
+             */
+            __m128d tmp1 = _mm_loadu_pd(&c->ptr.p_double[ji]);
+            __m128d tmp2 = _mm_set1_pd(d->ptr.p_double[1])-tmp1;
+            
+            __m128d tmp_cmp = _mm_cmple_pd(tmp2, _mm_set1_pd(pivmin));
+            __m128i itmp1 = _mm_and_si128(_mm_castpd_si128(tmp_cmp), _mm_set1_epi64x(1));
+            __m128d tmp_min = _mm_min_pd(tmp2,_mm_set1_pd(-pivmin));
+#ifdef __SSE4_1__
+            tmp2 = _mm_blendv_pd(tmp2, tmp_min, tmp_cmp);
+#else // !__SSE4_1__
+            tmp2 = _mm_or_pd(
+                _mm_andnot_pd(tmp_cmp, tmp2),
+                _mm_and_pd(tmp_cmp, tmp_min)
+            );
+#endif // !__SSE4_1__
+            
+            for(j=2; j<=n; j++)
+            {
+                tmp2 = _mm_set1_pd(d->ptr.p_double[j])-_mm_set1_pd(e2->ptr.p_double[j-1])/tmp2-tmp1;
+                
+                tmp_cmp = _mm_cmple_pd(tmp2, _mm_set1_pd(pivmin));
+                itmp1 = _mm_add_epi64(itmp1, _mm_and_si128(_mm_castpd_si128(tmp_cmp), _mm_set1_epi64x(1)));
+                tmp_min = _mm_min_pd(tmp2,_mm_set1_pd(-pivmin));
+#ifdef __SSE4_1__
+                tmp2 = _mm_blendv_pd(tmp2, tmp_min, tmp_cmp);
+#else // !__SSE4_1__
+                tmp2 = _mm_or_pd(
+                    _mm_andnot_pd(tmp_cmp, tmp2),
+                    _mm_and_pd(tmp_cmp, tmp_min)
+                );
+#endif // !__SSE4_1__
+            }
+            
+            ae_int_v2t itmp1v = (ae_int_v2t)itmp1;
+            for (int idx = 0; idx < 2; ++idx)
+            {
+#ifdef __x86_64__
+                if (postproc(ji + idx, itmp1v[idx], tmp1[idx]))
+                    return;
+#else // !__x86_64__
+                if (postproc(ji + idx, itmp1v[idx*2], tmp1[idx]))
+                    return;
+#endif // !__x86_64__
+            }
+#ifdef __AVX__
+            ji+=2;
+#endif // __AVX__
+        }
+#endif // __SSE2__
+
+#endif // !__AVX512F__
+        
+        // Scalar loop
+#ifdef __SSE2__
+        if(ji<=kl)
+#else // !__SSE2__
+        for(; ji<=kl; ji++)
+#endif // !__SSE2__
         {
             
             /*
@@ -45419,82 +45746,8 @@ static void evd_internaldlaebz(ae_int_t ijob,
                     tmp2 = ae_minreal(tmp2, -pivmin, _state);
                 }
             }
-            if( ijob<=2 )
-            {
-                
-                /*
-                 * IJOB=2: Choose all intervals containing eigenvalues.
-                 *
-                 * Insure that N(w) is monotone
-                 */
-                itmp1 = ae_minint(nab->ptr.pp_int[ji][2], ae_maxint(nab->ptr.pp_int[ji][1], itmp1, _state), _state);
-                
-                /*
-                 * Update the Queue -- add intervals if both halves
-                 * contain eigenvalues.
-                 */
-                if( itmp1==nab->ptr.pp_int[ji][2] )
-                {
-                    
-                    /*
-                     * No eigenvalue in the upper interval:
-                     * just use the lower interval.
-                     */
-                    ab->ptr.pp_double[ji][2] = tmp1;
-                }
-                else
-                {
-                    if( itmp1==nab->ptr.pp_int[ji][1] )
-                    {
-                        
-                        /*
-                         * No eigenvalue in the lower interval:
-                         * just use the upper interval.
-                         */
-                        ab->ptr.pp_double[ji][1] = tmp1;
-                    }
-                    else
-                    {
-                        if( klnew<mmax )
-                        {
-                            
-                            /*
-                             * Eigenvalue in both intervals -- add upper to queue.
-                             */
-                            klnew = klnew+1;
-                            ab->ptr.pp_double[klnew][2] = ab->ptr.pp_double[ji][2];
-                            nab->ptr.pp_int[klnew][2] = nab->ptr.pp_int[ji][2];
-                            ab->ptr.pp_double[klnew][1] = tmp1;
-                            nab->ptr.pp_int[klnew][1] = itmp1;
-                            ab->ptr.pp_double[ji][2] = tmp1;
-                            nab->ptr.pp_int[ji][2] = itmp1;
-                        }
-                        else
-                        {
-                            *info = mmax+1;
-                            return;
-                        }
-                    }
-                }
-            }
-            else
-            {
-                
-                /*
-                 * IJOB=3: Binary search.  Keep only the interval
-                 * containing  w  s.t. N(w) = NVAL
-                 */
-                if( itmp1<=nval->ptr.p_int[ji] )
-                {
-                    ab->ptr.pp_double[ji][1] = tmp1;
-                    nab->ptr.pp_int[ji][1] = itmp1;
-                }
-                if( itmp1>=nval->ptr.p_int[ji] )
-                {
-                    ab->ptr.pp_double[ji][2] = tmp1;
-                    nab->ptr.pp_int[ji][2] = itmp1;
-                }
-            }
+            if (postproc(ji, itmp1, tmp1))
+                return;
         }
         kl = klnew;
         
