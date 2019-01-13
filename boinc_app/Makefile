@@ -22,37 +22,29 @@ CPPFLAGS = -O3 \
 ifeq ($(MinGW32),1)
 $(info ===== Compiling MinGW 32-bit app version =====)
 CPP = i686-w64-mingw32-g++
-else
-ifeq ($(MinGW64),1)
+else ifeq ($(MinGW64),1)
 $(info ===== Compiling MinGW 64-bit app version =====)
 CPP = x86_64-w64-mingw32-g++
-else
-ifeq ($(M32),1)
+else ifeq ($(M32),1)
 $(info ===== Compiling 32-bit app version =====)
 CPP = g++ -m32
 else
 CPP = g++
 endif
-endif
-endif
 
 ifeq ($(SSE2),1)
 $(info ===== Compiling SSE2 app version =====)
 CPPFLAGS += -msse2
-else
-ifeq ($(SSE41),1)
+else ifeq ($(SSE41),1)
 $(info ===== Compiling SSE4.1 app version =====)
 CPPFLAGS += -msse4.1
-else
-ifeq ($(AVX),1)
+else ifeq ($(AVX),1)
 $(info ===== Compiling AVX app version =====)
 CPPFLAGS += -mavx -mtune=sandybridge
-else
-ifeq ($(AVX2),1)
+else ifeq ($(AVX2),1)
 $(info ===== Compiling AVX2 app version =====)
 CPPFLAGS += -mavx2 -mfma -mtune=haswell
-else
-ifeq ($(AVX512),1)
+else ifeq ($(AVX512),1)
 $(info ===== Compiling AVX512 app version =====)
 CPPFLAGS += -march=skylake-avx512
 ifeq ($(MinGW64),1)
@@ -61,10 +53,6 @@ ifeq ($(MinGW64),1)
 CPPFLAGS += \
 	-ffixed-xmm16 -ffixed-xmm17 -ffixed-xmm18 -ffixed-xmm19 -ffixed-xmm20 -ffixed-xmm21 -ffixed-xmm22 -ffixed-xmm23 \
 	-ffixed-xmm24 -ffixed-xmm25 -ffixed-xmm26 -ffixed-xmm27 -ffixed-xmm28 -ffixed-xmm29 -ffixed-xmm30 -ffixed-xmm31
-endif
-endif
-endif
-endif
 endif
 endif
 
